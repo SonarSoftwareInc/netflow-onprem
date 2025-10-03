@@ -9,6 +9,7 @@ use App\Models\DataUsage;
 use App\Models\NetflowOnPremise;
 use Exception;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use ReflectionClass;
 use Tests\TestCase;
 use PHPUnit\Framework\Attributes\Test;
 
@@ -101,10 +102,75 @@ class ProcessNetflowDataTest extends TestCase
         $this->appCleanup();
     }
 
+    #[Test]
+    public function ipv6_ranges_match_without_expansion_and_prefer_specific_assignments(): void
+    {
+        $job = new ProcessNetflowData("");
+
+        $assignments = [
+            (object)["subnet" => "2001:db8::/64", "account_id" => 10],
+            (object)["subnet" => "2001:db8::1", "account_id" => 20],
+        ];
+
+        $this->invokePrivateMethod($job, "createAccountMap", [$assignments]);
+
+        $map = $this->readAccountMap($job);
+        $this->assertArrayHasKey(6, $map);
+        $this->assertCount(1, $map[6]["prefixes"][64]);
+        $this->assertCount(1, $map[6]["single"]);
+
+        $this->assertSame(20, $this->invokePrivateMethod($job, "lookupAccountId", ["2001:db8::1"]));
+        $this->assertSame(10, $this->invokePrivateMethod($job, "lookupAccountId", ["2001:db8::1234"]));
+        $this->assertNull($this->invokePrivateMethod($job, "lookupAccountId", ["2001:db8:1::1"]));
+    }
+
+    #[Test]
+    public function ipv4_and_ipv6_networks_are_resolved_via_prefix_matching(): void
+    {
+        $job = new ProcessNetflowData("");
+
+        $assignments = [
+            (object)["subnet" => "192.0.2.0/31", "account_id" => 1],
+            (object)["subnet" => "192.0.2.2", "account_id" => 2],
+            (object)["subnet" => "2001:db8::/126", "account_id" => 3],
+        ];
+
+        $this->invokePrivateMethod($job, "createAccountMap", [$assignments]);
+
+        $this->assertSame(1, $this->invokePrivateMethod($job, "lookupAccountId", ["192.0.2.1"]));
+        $this->assertSame(2, $this->invokePrivateMethod($job, "lookupAccountId", ["192.0.2.2"]));
+        $this->assertNull($this->invokePrivateMethod($job, "lookupAccountId", ["192.0.2.255"]));
+        $this->assertSame(3, $this->invokePrivateMethod($job, "lookupAccountId", ["2001:db8::1"]));
+    }
+
     private function appCleanup(): void
     {
         $gql = new GraphQL();
         $netflow = NetflowOnPremise::first();
         $gql->post($netflow->deleteMutation());
+    }
+
+    /**
+     * @param array<int, mixed> $arguments
+     */
+    private function invokePrivateMethod(object $object, string $method, array $arguments = []): mixed
+    {
+        $reflection = new ReflectionClass($object);
+        $methodReflection = $reflection->getMethod($method);
+        $methodReflection->setAccessible(true);
+
+        return $methodReflection->invokeArgs($object, $arguments);
+    }
+
+    private function readAccountMap(ProcessNetflowData $job): array
+    {
+        $reflection = new ReflectionClass($job);
+        $property = $reflection->getProperty("accountMap");
+        $property->setAccessible(true);
+
+        /** @var array $map */
+        $map = $property->getValue($job);
+
+        return $map;
     }
 }

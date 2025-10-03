@@ -12,8 +12,7 @@ use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\Storage;
-use Leth\IPAddress\IP\Address;
-use Leth\IPAddress\IP\NetworkAddress;
+use InvalidArgumentException;
 
 class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
 {
@@ -28,7 +27,7 @@ class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
         public string $file,
         public ?string $storagePath = "/netflowData/"
     ) {
-        //
+        $this->initializeAccountMap();
     }
 
     public function handle(): void
@@ -80,7 +79,7 @@ class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
             $this->adjustTotals();
             $netflow->statistics = $this->statistics;
             $this->updateProgress($netflow);
-            $this->accountMap = [];
+            $this->initializeAccountMap();
         } while ($netflow->last_processed_filename !== $filename);
     }
 
@@ -132,16 +131,173 @@ class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
 
     private function createAccountMap(array $ipList): void
     {
+        $this->initializeAccountMap();
+
         foreach ($ipList as $ip) {
+            if (! isset($ip->subnet, $ip->account_id)) {
+                continue;
+            }
+
+            $accountId = (int)$ip->account_id;
             if (str_contains($ip->subnet, "/")) {
-                $networkAddress = NetworkAddress::factory($ip->subnet);
-                foreach ($networkAddress as $address) {
-                    $this->accountMap[(string)$address] = $ip->account_id;
+                [$address, $prefix] = explode("/", $ip->subnet, 2);
+                $address = trim($address);
+                $prefix = trim($prefix);
+                if ($address === "" || $prefix === "") {
+                    continue;
                 }
-            } else {
-                $this->accountMap[$ip->subnet] = $ip->account_id;
+                $this->storeNetworkAssignment($address, (int)$prefix, $accountId);
+                continue;
+            }
+
+            $this->storeSingleAddress(trim($ip->subnet), $accountId);
+        }
+
+        $this->finalizePrefixOrdering(4);
+        $this->finalizePrefixOrdering(6);
+    }
+
+    private function initializeAccountMap(): void
+    {
+        $this->accountMap = [
+            4 => [
+                "single" => [],
+                "prefixes" => [],
+                "ordered_prefixes" => [],
+            ],
+            6 => [
+                "single" => [],
+                "prefixes" => [],
+                "ordered_prefixes" => [],
+            ],
+        ];
+    }
+
+    private function storeSingleAddress(string $ip, int $accountId): void
+    {
+        if ($ip === "") {
+            return;
+        }
+
+        $packed = $this->inetPton($ip);
+        $version = $this->ipVersionFromPacked($packed);
+        $this->accountMap[$version]["single"][bin2hex($packed)] = $accountId;
+    }
+
+    private function storeNetworkAssignment(string $ip, int $prefixLength, int $accountId): void
+    {
+        $packed = $this->inetPton($ip);
+        $version = $this->ipVersionFromPacked($packed);
+        $this->validatePrefixLength($prefixLength, $version);
+
+        $masked = $this->applyPrefixMask($packed, $prefixLength);
+        $key = bin2hex($masked);
+
+        $this->accountMap[$version]["prefixes"][$prefixLength][$key] = $accountId;
+    }
+
+    private function finalizePrefixOrdering(int $version): void
+    {
+        if (empty($this->accountMap[$version]["prefixes"])) {
+            $this->accountMap[$version]["ordered_prefixes"] = [];
+            return;
+        }
+
+        $prefixes = array_keys($this->accountMap[$version]["prefixes"]);
+        rsort($prefixes);
+        $this->accountMap[$version]["ordered_prefixes"] = $prefixes;
+    }
+
+    private function lookupAccountId(string $ip): ?int
+    {
+        $ip = trim($ip);
+        if ($ip === "") {
+            return null;
+        }
+
+        $packed = @inet_pton($ip);
+        if ($packed === false) {
+            return null;
+        }
+
+        $version = $this->ipVersionFromPacked($packed);
+        $singleKey = bin2hex($packed);
+
+        if (isset($this->accountMap[$version]["single"][$singleKey])) {
+            return $this->accountMap[$version]["single"][$singleKey];
+        }
+
+        foreach ($this->accountMap[$version]["ordered_prefixes"] as $prefixLength) {
+            $masked = $this->applyPrefixMask($packed, $prefixLength);
+            $key = bin2hex($masked);
+            if (isset($this->accountMap[$version]["prefixes"][$prefixLength][$key])) {
+                return $this->accountMap[$version]["prefixes"][$prefixLength][$key];
             }
         }
+
+        return null;
+    }
+
+    private function applyPrefixMask(string $packedIp, int $prefixLength): string
+    {
+        $byteLength = strlen($packedIp);
+        $maxPrefix = $byteLength * 8;
+
+        if ($prefixLength < 0 || $prefixLength > $maxPrefix) {
+            throw new InvalidArgumentException("Invalid prefix length '{$prefixLength}' for address length '{$byteLength}'.");
+        }
+
+        $masked = "";
+        for ($i = 0; $i < $byteLength; $i++) {
+            $bitsRemaining = $prefixLength - ($i * 8);
+
+            if ($bitsRemaining >= 8) {
+                $masked .= $packedIp[$i];
+                continue;
+            }
+
+            if ($bitsRemaining <= 0) {
+                $masked .= "\0";
+                continue;
+            }
+
+            $byte = ord($packedIp[$i]);
+            $mask = (0xFF << (8 - $bitsRemaining)) & 0xFF;
+            $masked .= chr($byte & $mask);
+        }
+
+        return $masked;
+    }
+
+    private function validatePrefixLength(int $prefixLength, int $version): void
+    {
+        $maxPrefix = $version === 4 ? 32 : 128;
+        if ($prefixLength < 0 || $prefixLength > $maxPrefix) {
+            throw new InvalidArgumentException("Invalid prefix length '{$prefixLength}' for IPv{$version} subnet.");
+        }
+    }
+
+    private function ipVersionFromPacked(string $packedIp): int
+    {
+        $length = strlen($packedIp);
+        if ($length === 4) {
+            return 4;
+        }
+        if ($length === 16) {
+            return 6;
+        }
+
+        throw new InvalidArgumentException("Unknown IP version for packed address of length '{$length}'.");
+    }
+
+    private function inetPton(string $ip): string
+    {
+        $packed = @inet_pton($ip);
+        if ($packed === false) {
+            throw new InvalidArgumentException("Invalid IP address '{$ip}'.");
+        }
+
+        return $packed;
     }
 
 
@@ -177,19 +333,22 @@ class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
         if (is_null($srcIp) || is_null($dstIp)) {
             return;
         }
-        // Perform test as we only want to do expensive conversions if necessary
-        if (! isset($this->accountMap[$srcIp]) && ! isset($this->accountMap[$dstIp])) {
-            return;
-        }
         $startDate = Carbon::createFromTimestampMs($flowFields[1]);
         $endDate = Carbon::createFromTimestampMs($flowFields[2]);
 
-        if (isset($this->accountMap[$srcIp])) {
-            $this->collectUsage($this->accountMap[$srcIp], $startDate, $endDate, 0, (int)$flowFields[21]);
+        $srcAccountId = $this->lookupAccountId($srcIp);
+        $dstAccountId = $this->lookupAccountId($dstIp);
+
+        if (is_null($srcAccountId) && is_null($dstAccountId)) {
+            return;
         }
 
-        if (isset($this->accountMap[$dstIp])) {
-            $this->collectUsage($this->accountMap[$dstIp], $startDate, $endDate, (int)$flowFields[21], 0);
+        if (! is_null($srcAccountId)) {
+            $this->collectUsage($srcAccountId, $startDate, $endDate, 0, (int)$flowFields[21]);
+        }
+
+        if (! is_null($dstAccountId)) {
+            $this->collectUsage($dstAccountId, $startDate, $endDate, (int)$flowFields[21], 0);
         }
     }
 
@@ -255,6 +414,7 @@ query accountIpAssignments {
     }
   }
 }
+
 GQL;
         $assignmentResponse = $this->gql->post(["query" => $query]);
         $body = json_decode($assignmentResponse->getBody());
