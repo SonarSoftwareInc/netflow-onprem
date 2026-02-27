@@ -139,18 +139,30 @@ class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
             }
 
             $accountId = (int)$ip->account_id;
-            if (str_contains($ip->subnet, "/")) {
-                [$address, $prefix] = explode("/", $ip->subnet, 2);
-                $address = trim($address);
-                $prefix = trim($prefix);
-                if ($address === "" || $prefix === "") {
+            $subnet = trim((string)$ip->subnet);
+
+            try {
+                if (str_contains($subnet, "/")) {
+                    [$address, $prefix] = explode("/", $subnet, 2);
+                    $address = trim($address);
+                    $prefix = trim($prefix);
+                    if ($address === "" || $prefix === "") {
+                        continue;
+                    }
+
+                    if (! preg_match("/^\d+$/", $prefix)) {
+                        continue;
+                    }
+
+                    $this->storeNetworkAssignment($address, (int)$prefix, $accountId);
                     continue;
                 }
-                $this->storeNetworkAssignment($address, (int)$prefix, $accountId);
+
+                $this->storeSingleAddress($subnet, $accountId);
+            } catch (InvalidArgumentException) {
+                // Invalid assignment values should not stop processing of all data.
                 continue;
             }
-
-            $this->storeSingleAddress(trim($ip->subnet), $accountId);
         }
 
         $this->finalizePrefixOrdering(4);
@@ -333,15 +345,15 @@ class ProcessNetflowData implements ShouldQueue, ShouldBeUnique
         if (is_null($srcIp) || is_null($dstIp)) {
             return;
         }
-        $startDate = Carbon::createFromTimestampMs($flowFields[1]);
-        $endDate = Carbon::createFromTimestampMs($flowFields[2]);
-
         $srcAccountId = $this->lookupAccountId($srcIp);
         $dstAccountId = $this->lookupAccountId($dstIp);
 
         if (is_null($srcAccountId) && is_null($dstAccountId)) {
             return;
         }
+
+        $startDate = Carbon::createFromTimestampMs($flowFields[1]);
+        $endDate = Carbon::createFromTimestampMs($flowFields[2]);
 
         if (! is_null($srcAccountId)) {
             $this->collectUsage($srcAccountId, $startDate, $endDate, 0, (int)$flowFields[21]);

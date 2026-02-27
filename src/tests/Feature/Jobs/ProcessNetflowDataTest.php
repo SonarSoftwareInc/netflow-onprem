@@ -143,6 +143,24 @@ class ProcessNetflowDataTest extends TestCase
         $this->assertSame(3, $this->invokePrivateMethod($job, "lookupAccountId", ["2001:db8::1"]));
     }
 
+    #[Test]
+    public function invalid_assignments_are_ignored_and_do_not_create_broad_matches(): void
+    {
+        $job = new ProcessNetflowData("");
+
+        $assignments = [
+            (object)["subnet" => "2001:db8::/foo", "account_id" => 10],
+            (object)["subnet" => "2001:db8::/64abc", "account_id" => 11],
+            (object)["subnet" => "not-an-ip", "account_id" => 12],
+            (object)["subnet" => "2001:db8::/64", "account_id" => 13],
+        ];
+
+        $this->invokePrivateMethod($job, "createAccountMap", [$assignments]);
+
+        $this->assertSame(13, $this->invokePrivateMethod($job, "lookupAccountId", ["2001:db8::1234"]));
+        $this->assertNull($this->invokePrivateMethod($job, "lookupAccountId", ["2001:db9::1"]));
+    }
+
     private function appCleanup(): void
     {
         $gql = new GraphQL();
