@@ -1,4 +1,4 @@
-FROM php:8.3.14-fpm-alpine3.20
+FROM php:8.3.36-fpm-alpine3.23
 
 ARG NFDUMP_VERSION
 ARG UID
@@ -64,11 +64,13 @@ WORKDIR /tmp
 ADD https://github.com/phaag/nfdump/archive/v${NFDUMP_VERSION}.tar.gz /tmp
 RUN apk add --no-cache --virtual build-deps autoconf automake m4 pkgconfig make g++ flex byacc
 # Build and cleanup after ourselves
+# GCC 14+ (alpine 3.21+) errors on implicit declarations: expose setresuid/setresgid via _GNU_SOURCE
+# and force __fpurge, since musl links fpurge but never declares it
 RUN  \
     tar xfz v${NFDUMP_VERSION}.tar.gz  \
     && cd /tmp/nfdump-${NFDUMP_VERSION} \
     && ./autogen.sh  \
-    && ./configure  \
+    && ./configure CPPFLAGS="-D_GNU_SOURCE" ac_cv_func_fpurge=no \
     && make  \
     && cd /tmp/nfdump-${NFDUMP_VERSION} && make install  \
     && cd .. \
